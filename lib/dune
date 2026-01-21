@@ -1,4 +1,5 @@
 (library
  (name cattery)
+ (public_name cattery)
  (modules cattery cells)
  (libraries miou fmt))
