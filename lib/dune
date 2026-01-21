@@ -1,0 +1,4 @@
+(library
+ (name cattery)
+ (modules cattery cells)
+ (libraries miou fmt))
