@@ -16,5 +16,6 @@ depends: [
   "ocaml"             {>= "5.0.0"}
   "dune"              {>= "2.8.0"}
   "miou"
+  "fmt"
 ]
 x-maintenance-intent: [ "(latest)" ]
