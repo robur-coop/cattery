@@ -99,17 +99,6 @@ let rec add t x =
   in
   go ()
 
-(* Try to cancel by transitioning from [Request] to [Finished].
-   This can only be called after previously transitioning to [Request]. *)
-let cancel segment cell =
-  match Atomic.exchange cell Cell.Finished with
-  | Request _ ->
-      Q.cancel_cell segment;
-      true
-  | Finished -> false (* Already resumed; reject cancellation *)
-  | In_transition | Resource _ ->
-      assert false (* Can't get here from [Request]. *)
-
 (* If [t] is under capacity, add another (empty) slot. *)
 let rec maybe_add_slot t current =
   if current < t.max_slots then
@@ -156,6 +145,7 @@ let run_new_and_dispose t fn =
       Printexc.raise_with_backtrace exn bt
 
 module Ivar = Miou.Computation
+let cancel = (Miou.Cancelled, Printexc.get_callstack 0)
 
 let use t ?(never_block = false) fn =
   let segment, cell = Q.next_suspend t.q in
@@ -187,21 +177,39 @@ let use t ?(never_block = false) fn =
              2) or someone has concurrently just provided us with a slot.
 
              In both branches, the goal is to fill our [Ivar]. Then, we await
-             our [Ivar]. In the second case, there will be no waiting time since
-             it has just been filled. However, within the project, it is during
-             the release of another task that our [Ivar] will be filled, so we
-             are in a waiting state.
+             our [Ivar]. In the second case, there will be no waiting time
+             since it has just been filled. However, within the project, it is
+             during the release of another task that our [Ivar] will be filled,
+             so we are in a waiting state.
 
-             During this wait, we may be subject to cancellation. In this event,
-             [Miou.Ownership] guarantees that our [finally] is executed. The
-             latter cancels the segment and discontinues [Ivar.await_exn].
-             Consequently, [disown] and [run_with] are not executed, and the
-             resource is properly cleaned up. *)
-          let finally () = ignore (cancel segment cell) in
+             During this wait, we may be subject to cancellation. In this
+             event, the scheduler discontinues [Ivar.await_exn] and
+             [Miou.Ownership] guarantees that our [finally] is executed,
+             instead of [disown] and [run_with]. If we were still waiting
+             ([Request]), [finally] cancels the cell.
+
+             Otherwise ([Finished]), a resumer gave us a slot. But [add] is not
+             atomic: it sets the cell to [Finished] and then calls [fill], so
+             the slot may not be in our [ivar] yet. Only one of [try_cancel]
+             and [try_return] can complete the [ivar], which ensures that the
+             slot goes back to the pool exactly once:
+             - if [try_cancel] fails in [finally], [fill] already stored the
+               slot: [finally] reads it from the [ivar] and calls [add].
+             - if [try_return] fails in [fill], [finally] already closed the
+               [ivar], nobody will read it: [fill] calls [add]. *)
+          let ivar = Ivar.create () in
+          let finally () =
+            match Atomic.exchange cell Finished with
+            | Request _ -> Q.cancel_cell segment
+            | In_transition | Resource _ -> assert false
+            | Finished ->
+              if not (Ivar.try_cancel ivar cancel)
+              then match Ivar.peek ivar with
+                   | Some (Ok slot) -> add t slot
+                   | _ -> () in
           let res = Miou.Ownership.create ~finally () in
           Miou.Ownership.own res;
-          let ivar = Ivar.create () in
-          let fill slot = ignore (Ivar.try_return ivar slot) in
+          let fill slot = if not (Ivar.try_return ivar slot) then add t slot in
           let set = Atomic.compare_and_set cell In_transition (Request fill) in
           if not set then begin
             match Atomic.exchange cell Finished with
